@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager, suppress
 from collections import defaultdict
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart
@@ -14,6 +15,7 @@ from db import repos
 router = Router()
 locks = defaultdict(asyncio.Lock)
 HUMAN = re.compile(r'оператор|человек|менеджер', re.IGNORECASE)
+READY = re.compile(r'\b(?:хочу|готов(?:а|ы)?|можно|как|буду|желаю)\s+(?:у\s+вас\s+)?(?:купить|оплатить|заказать|оформить\s+(?:покупку|заказ|оплату))\b', re.IGNORECASE)
 PHONE = re.compile(r'(?<!\w)\+?\d[\d ()\-]{8,}\d(?!\w)')
 QUESTION = re.compile(r'\?|сколько|стоимост|цен[аыуе]|как|когда|гаранти|ремонт|диагност|срок', re.IGNORECASE)
 EMAIL = re.compile(r'(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-zа-я]{2,}', re.IGNORECASE)
@@ -27,6 +29,26 @@ def extract_contact(text):
         if 10 <= sum(char.isdigit() for char in match.group(0)) <= 15:
             return match.group(0).strip()
     return None
+
+
+@asynccontextmanager
+async def typing(bot, chat_id):
+    """Telegram typing expires after ~5 seconds, so renew while work is pending."""
+    async def send():
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action='typing')
+            except Exception:
+                logging.debug('Could not send typing action', exc_info=True)
+            await asyncio.sleep(4)
+    task = asyncio.create_task(send())
+    await asyncio.sleep(0)
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 async def send_and_record(message, tg_id, text):
@@ -60,6 +82,11 @@ async def client_start(message: Message):
 
 
 async def process_client(message, bot, text, contact=None):
+    async with typing(bot, message.from_user.id):
+        await _process_client(message, bot, text, contact)
+
+
+async def _process_client(message, bot, text, contact=None):
     tg_id, username = message.from_user.id, message.from_user.username
     async with locks[tg_id]:
         repos.ensure_conversation(tg_id, username)
@@ -91,15 +118,16 @@ async def process_client(message, bot, text, contact=None):
                 logging.exception('Failed to forward client message')
                 await send_and_record(message, tg_id, 'Не удалось передать сообщение. Пожалуйста, попробуйте позже.')
             return
-        if HUMAN.search(text):
+        if HUMAN.search(text) or READY.search(text):
             try:
-                await escalate(bot, tg_id, username, 'Клиент попросил менеджера')
+                reason = 'Клиент готов оформить заказ или оплату' if READY.search(text) else 'Клиент попросил менеджера'
+                await escalate(bot, tg_id, username, reason)
                 answer = 'Передаю ваш запрос менеджеру.'
                 provided_contact = contact or extract_contact(text)
                 if provided_contact:
                     question = next((content for role, content in reversed(history) if role == 'user'), text)
                     try:
-                        await save_lead(bot, tg_id, username, provided_contact, question)
+                        await save_lead(bot, tg_id, username, provided_contact, question, 'buy' if READY.search(text) else 'consult')
                         answer = 'Контакт сохранён, ваш запрос передан менеджеру.'
                     except Exception:
                         logging.exception('Failed to save contact in human request')
@@ -187,7 +215,8 @@ async def process_media(message, bot):
     kind = 'photo' if message.photo else 'voice'
     attachment = message.photo[-1] if message.photo else message.voice
     try:
-        description = await media.extract(bot, attachment, kind)
+        async with typing(bot, message.from_user.id):
+            description = await media.extract(bot, attachment, kind)
     except Exception:
         logging.exception('Could not process incoming media')
         await message.answer('Не удалось разобрать файл. Пожалуйста, напишите вопрос текстом или отправьте файл размером до 8 МБ.')

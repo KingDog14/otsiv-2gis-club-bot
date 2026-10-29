@@ -22,6 +22,7 @@ class Settings:
     GIGACHAT_MODEL: str = os.getenv('GIGACHAT_MODEL', 'GigaChat-2').strip()
     GSHEETS_CREDENTIALS_JSON: str = os.getenv('GSHEETS_CREDENTIALS_JSON', './gsheets.json')
     GSHEETS_SPREADSHEET_ID: str = os.getenv('GSHEETS_SPREADSHEET_ID', '')
+    LEADS_SHEET_NAME: str = os.getenv('LEADS_SHEET_NAME', '').strip()
     COMPANY_NAME: str = os.getenv('COMPANY_NAME', 'Тестовая компания')
     KNOWLEDGE_PATH: str = os.getenv('KNOWLEDGE_PATH', './knowledge.txt')
     BOT_SETUP_AVATAR: bool = os.getenv('BOT_SETUP_AVATAR', 'true').strip().lower() in ('1', 'true', 'yes', 'on')

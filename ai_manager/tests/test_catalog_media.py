@@ -1,4 +1,5 @@
 import unittest
+import gspread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -17,7 +18,12 @@ class CatalogTests(unittest.TestCase):
             ['Старая услуга', '100 ₽', 'не продаётся', 'false'],
         ]
         self.news.get_all_values.return_value = [['title', 'text', 'active'], ['График', 'В субботу до 17', 'true']]
-        self.book.worksheet.side_effect = lambda n: {'Services': self.services, 'News': self.news}[n]
+        def sheet(name):
+            mapping = {'Услуги': self.services, 'Новости': self.news}
+            if name not in mapping:
+                raise gspread.WorksheetNotFound(name)
+            return mapping[name]
+        self.book.worksheet.side_effect = sheet
 
     def test_catalog_skips_inactive_and_search_includes_live_data(self):
         with patch.object(gsheets, '_book', return_value=self.book):
@@ -74,7 +80,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         api.delete_file.assert_called_once_with('file-id')
 
     async def test_media_transcription_becomes_client_message(self):
-        message = SimpleNamespace(photo=None, voice=SimpleNamespace(file_id='voice', file_size=10), caption=None, answer=AsyncMock())
+        message = SimpleNamespace(from_user=SimpleNamespace(id=123), photo=None, voice=SimpleNamespace(file_id='voice', file_size=10), caption=None, answer=AsyncMock())
         bot = MagicMock()
         with patch.object(media, 'extract', new=AsyncMock(return_value='Не включается ноутбук')), patch.object(client, 'process_client', new=AsyncMock()) as process:
             await client.process_media(message, bot)
@@ -115,12 +121,14 @@ class AdminCatalogTests(unittest.IsolatedAsyncioTestCase):
         await manager.navigation(self.callback, self.bot)
         message = SimpleNamespace(from_user=SimpleNamespace(id=self.owner), text='Диагностика | 500 ₽ | Проверка', answer=AsyncMock())
         with patch.object(manager.gsheets, 'add_entry') as save, patch.object(manager.gsheets, 'catalog', return_value={'Services': [], 'News': []}):
-            await manager.owner_message(message, self.bot)
+            for value in ('Диагностика | для дома', '500 ₽', 'Проверка'):
+                message.text = value
+                await manager.owner_message(message, self.bot)
             save.assert_not_called()
             token = manager.pending_changes[self.owner][0]
             self.callback.data = 'admin:confirm:' + token
             await manager.navigation(self.callback, self.bot)
-            save.assert_called_once_with('Services', ['Диагностика', '500 ₽', 'Проверка'])
+            save.assert_called_once_with('Services', ['Диагностика | для дома', '500 ₽', 'Проверка'])
             await manager.navigation(self.callback, self.bot)
             save.assert_called_once()
 
@@ -140,16 +148,57 @@ class AdminCatalogTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_news_edit_previews_and_confirm_writes_expected_value(self):
         self.callback.data = 'admin:add:NewsEdit'
-        await manager.navigation(self.callback, self.bot)
-        message = SimpleNamespace(from_user=SimpleNamespace(id=self.owner), text='График | Теперь до 18:00', answer=AsyncMock())
         catalog = {'Services': [], 'News': [{'title': 'График', 'text': 'До 17:00'}]}
         with patch.object(manager.gsheets, 'catalog', return_value=catalog), patch.object(manager.gsheets, 'update_news') as save:
+            await manager.navigation(self.callback, self.bot)
+            token = next(iter(manager.selection_choices))
+            self.callback.data = 'admin:select:' + token
+            await manager.navigation(self.callback, self.bot)
+            message = SimpleNamespace(from_user=SimpleNamespace(id=self.owner), text='Теперь до 18:00', answer=AsyncMock())
             await manager.owner_message(message, self.bot)
             save.assert_not_called()
             token = manager.pending_changes[self.owner][0]
             self.callback.data = 'admin:confirm:' + token
             await manager.navigation(self.callback, self.bot)
             save.assert_called_once_with('График', 'Теперь до 18:00', 'До 17:00')
+
+    async def test_toggle_inactive_service_with_confirmation(self):
+        catalog = {'Services': [{'name': 'Замена', 'price': '100', 'active': 'false', '_active': False}], 'News': []}
+        self.callback.data = 'admin:add:ServiceToggle'
+        with patch.object(manager.gsheets, 'catalog', return_value=catalog), patch.object(manager.gsheets, 'set_active') as save:
+            await manager.navigation(self.callback, self.bot)
+            token = next(iter(manager.selection_choices))
+            self.callback.data = 'admin:select:' + token
+            await manager.navigation(self.callback, self.bot)
+            save.assert_not_called()
+            token = manager.pending_changes[self.owner][0]
+            self.callback.data = 'admin:confirm:' + token
+            await manager.navigation(self.callback, self.bot)
+            save.assert_called_once_with('Services', 'Замена', 'true', 'false')
+
+    async def test_wizard_back_removes_previous_value(self):
+        await manager.navigation(self.callback, self.bot)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=self.owner), text='Название', answer=AsyncMock())
+        await manager.owner_message(message, self.bot)
+        self.assertEqual(manager.catalog_modes[self.owner]['fields'], ['Название'])
+        self.callback.data = 'admin:wback'
+        await manager.navigation(self.callback, self.bot)
+        self.assertEqual(manager.catalog_modes[self.owner]['fields'], [])
+
+    async def test_context_can_be_added_in_panel_with_confirmation(self):
+        self.callback.data = 'admin:add:Context'
+        await manager.navigation(self.callback, self.bot)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=self.owner), text='Условия', answer=AsyncMock())
+        catalog = {'Services': [], 'News': [], 'Context': []}
+        with patch.object(manager.gsheets, 'catalog', return_value=catalog), patch.object(manager.gsheets, 'add_entry') as save:
+            await manager.owner_message(message, self.bot)
+            message.text = 'Консультация проводится по записи.'
+            await manager.owner_message(message, self.bot)
+            save.assert_not_called()
+            token = manager.pending_changes[self.owner][0]
+            self.callback.data = 'admin:confirm:' + token
+            await manager.navigation(self.callback, self.bot)
+            save.assert_called_once_with('Context', ['Условия', 'Консультация проводится по записи.'])
 
     async def test_switch_to_test_cancels_catalog_input(self):
         await manager.navigation(self.callback, self.bot)
