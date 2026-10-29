@@ -4,7 +4,8 @@ import re
 from collections import defaultdict
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from types import SimpleNamespace
 from config import settings
 from core import assistant, gsheets
 from core.tools import escalate, keyboard
@@ -14,6 +15,7 @@ router = Router()
 locks = defaultdict(asyncio.Lock)
 HUMAN = re.compile(r'оператор|человек|менеджер', re.IGNORECASE)
 PHONE = re.compile(r'(?<!\w)\+?\d[\d ()\-]{8,}\d(?!\w)')
+QUESTION = re.compile(r'\?|сколько|стоимост|цен[аыуе]|как|когда|гаранти|ремонт|диагност|срок', re.IGNORECASE)
 EMAIL = re.compile(r'(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-zа-я]{2,}', re.IGNORECASE)
 
 
@@ -28,6 +30,7 @@ def extract_contact(text):
 
 
 async def send_and_record(message, tg_id, text):
+    text = text[:4000]
     await message.answer(text)
     repos.add_message(tg_id, 'assistant', text)
 
@@ -37,7 +40,15 @@ async def client_start(message: Message):
     if message.from_user.id == settings.OWNER_TG_ID:
         return
     repos.ensure_conversation(message.from_user.id, message.from_user.username)
-    await message.answer(f'Здравствуйте! Я администратор {settings.COMPANY_NAME}. Напишите ваш вопрос — я помогу или передам его менеджеру.')
+    await message.answer(
+        f'Здравствуйте! Я администратор {settings.COMPANY_NAME}.\n\n'
+        'Расскажу об услугах и условиях, помогу оформить обращение или подключу менеджера. '
+        'Напишите вопрос или выберите тему:',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🛠 Услуги и цены', callback_data='client:prices'),
+             InlineKeyboardButton(text='🕒 Время работы', callback_data='client:hours')],
+            [InlineKeyboardButton(text='👤 Позвать менеджера', callback_data='client:human')],
+        ]))
 
 
 async def process_client(message, bot, text, contact=None):
@@ -46,6 +57,9 @@ async def process_client(message, bot, text, contact=None):
         repos.ensure_conversation(tg_id, username)
         history = repos.history(tg_id, 10)
         repos.add_message(tg_id, 'user', text)
+        if repos.is_escalated(tg_id) and tg_id == settings.OWNER_TG_ID and not (contact or extract_contact(text)):
+            await send_and_record(message, tg_id, 'Тестовое обращение уже передано менеджеру. Откройте /panel и завершите его в разделе «Обращения», чтобы продолжить тест.')
+            return
         if repos.is_escalated(tg_id):
             contact = contact or extract_contact(text)
             saved = False
@@ -91,11 +105,26 @@ async def process_client(message, bot, text, contact=None):
             return
         contact = contact or extract_contact(text)
         if contact:
-            question = next((content for role, content in reversed(history) if role == 'user'), text)
+            question = text if QUESTION.search(text) else next((content for role, content in reversed(history) if role == 'user'), text)
             try:
                 await asyncio.to_thread(gsheets.save, tg_id, username, contact, question, 'consult')
                 repos.add_lead(tg_id, username, contact, question, 'consult')
-                answer = 'Спасибо! Сохранил ваш контакт, менеджер сможет с вами связаться.'
+                answer = 'Спасибо! Ваш контакт сохранён.'
+                if QUESTION.search(text):
+                    try:
+                        detail = await assistant.prepare(bot, tg_id, username, history, text, lead_saved=True)
+                        answer += '\n\n' + detail
+                    except Exception:
+                        logging.exception('Failed to answer after saving contact')
+                        try:
+                            if not repos.is_escalated(tg_id):
+                                await escalate(bot, tg_id, username, 'Не удалось ответить на вопрос после сохранения контакта')
+                            answer += ' Ваш вопрос передан менеджеру.'
+                        except Exception:
+                            logging.exception('Failed to escalate after saving contact')
+                            answer += ' Не удалось передать вопрос менеджеру; попробуйте позже.'
+                else:
+                    answer += ' Опишите технику и проблему, если ещё не рассказали о них.'
             except Exception:
                 logging.exception('Failed to save lead')
                 try:
@@ -118,6 +147,29 @@ async def process_client(message, bot, text, contact=None):
                 logging.exception('Failed to escalate')
                 answer = 'Не удалось связаться с менеджером. Пожалуйста, попробуйте позже.'
         await send_and_record(message, tg_id, answer[:4000])
+
+
+@router.callback_query(F.data.startswith('client:'))
+async def shortcut(callback: CallbackQuery, bot: Bot):
+    if not callback.message or callback.message.chat.type != 'private':
+        await callback.answer('Откройте бота в личном чате.', show_alert=True)
+        return
+    if callback.from_user.id == settings.OWNER_TG_ID:
+        from bot.handlers.manager import test_mode
+        if callback.from_user.id not in test_mode:
+            await callback.answer('Для тестирования откройте /test.', show_alert=True)
+            return
+    queries = {'client:prices': 'Какие услуги и цены?',
+               'client:hours': 'Какой режим работы?',
+               'client:human': 'Позовите менеджера'}
+    text = queries.get(callback.data)
+    if text is None:
+        await callback.answer('Неизвестная команда')
+        return
+    await callback.answer()
+    # Use the clicking user's identity; callback.message was sent by the bot.
+    proxy = SimpleNamespace(from_user=callback.from_user, answer=callback.message.answer)
+    await process_client(proxy, bot, text)
 
 
 @router.message(F.chat.type == 'private', F.text)

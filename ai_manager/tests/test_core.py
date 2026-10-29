@@ -13,7 +13,7 @@ import tempfile
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_search_and_human(self):
-        self.assertIn('900', ' '.join(tools.search_knowledge('сколько стоит кружка')['results']))
+        self.assertIn('2500', ' '.join(tools.search_knowledge('замена экрана смартфона')['results']))
         self.assertEqual(tools.search_knowledge('квазичастица')['status'], 'empty')
         for text in ('Позовите человека', 'оператор', 'менеджер'):
             self.assertTrue(HUMAN.search(text))
@@ -49,3 +49,15 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AgentContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lead_already_saved_disables_save_tool_and_keeps_history(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content='От 2500 рублей.'))])
+        with patch.object(assistant, 'chat', return_value=response) as chat:
+            answer = await assistant.prepare(None, 1, None, [('user', 'У меня смартфон')], 'Цена? +7 999 123-45-67', lead_saved=True)
+        payload = chat.call_args.args[0]
+        self.assertEqual(answer, 'От 2500 рублей.')
+        self.assertNotIn('save_lead', [fn.name for fn in payload.functions])
+        self.assertIn('У меня смартфон', [message.content for message in payload.messages])
+        self.assertIn('уже сохранён', payload.messages[0].content)

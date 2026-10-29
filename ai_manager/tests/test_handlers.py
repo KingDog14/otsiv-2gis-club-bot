@@ -15,6 +15,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.db.start()
         repos.init_db()
         manager.sessions.clear()
+        manager.test_mode.clear()
         self.bot = SimpleNamespace(send_message=AsyncMock(), edit_message_text=AsyncMock())
         self.msg = SimpleNamespace(from_user=SimpleNamespace(id=123, username='tester'), answer=AsyncMock())
 
@@ -22,6 +23,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.db.stop()
         self.tmp.cleanup()
         manager.sessions.clear()
+        manager.test_mode.clear()
 
     async def test_human_bypasses_model_and_visible_in_queue(self):
         with patch.object(client.assistant, 'prepare', new=AsyncMock()) as model:
@@ -45,7 +47,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         model.assert_not_awaited()
         self.assertEqual(save.call_args.args[3], 'Хочу купить кружку')
         self.assertEqual(repos.stats()[1], 1)
-        self.assertIn('сохранил', self.msg.answer.await_args.args[0].lower())
+        self.assertIn('сохранён', self.msg.answer.await_args.args[0].lower())
 
     async def test_model_failure_after_escalation_does_not_duplicate(self):
         async def failing(*args):
@@ -98,3 +100,41 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(repos.is_escalated(123))
         self.assertEqual(repos.stats()[1], 0)
         self.assertIn('Не удалось сохранить', self.msg.answer.await_args.args[0])
+
+    async def test_admin_real_test_requires_confirmation_and_exits(self):
+        owner_id = manager.settings.OWNER_TG_ID
+        owner = SimpleNamespace(id=owner_id, username='owner')
+        panel = SimpleNamespace(chat=SimpleNamespace(id=owner_id, type='private'), message_id=7, edit_text=AsyncMock())
+        callback = SimpleNamespace(from_user=owner, message=panel, data='admin:test', answer=AsyncMock())
+        await manager.navigation(callback, self.bot)
+        self.assertNotIn(owner_id, manager.test_mode)
+        self.assertIn('по-настоящему', panel.edit_text.await_args.args[0])
+        callback.data = 'admin:test:start'
+        await manager.navigation(callback, self.bot)
+        self.assertIn(owner_id, manager.test_mode)
+        msg = SimpleNamespace(from_user=owner, text='Что с гарантией?', answer=AsyncMock())
+        with patch.object(client.assistant, 'prepare', new=AsyncMock(return_value='Гарантия 3 месяца.')) as model:
+            await manager.owner_message(msg, self.bot)
+        model.assert_awaited_once()
+        self.assertEqual(repos.history(owner_id)[-1][1], 'Гарантия 3 месяца.')
+        callback.data = 'admin:home'
+        await manager.navigation(callback, self.bot)
+        self.assertNotIn(owner_id, manager.test_mode)
+
+    async def test_admin_test_real_lead(self):
+        owner_id = manager.settings.OWNER_TG_ID
+        manager.test_mode.add(owner_id)
+        msg = SimpleNamespace(from_user=SimpleNamespace(id=owner_id, username='owner'),
+                              text='+7 999 123-45-67', answer=AsyncMock())
+        with patch.object(client.gsheets, 'save') as save:
+            await manager.owner_message(msg, self.bot)
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0], owner_id)
+        self.assertEqual(repos.stats()[1], 1)
+
+    async def test_question_with_contact_saves_and_answers_once(self):
+        with patch.object(client.gsheets, 'save') as save, patch.object(client.assistant, 'prepare', new=AsyncMock(return_value='От 2500 рублей.')) as model:
+            await client.process_client(self.msg, self.bot, 'Сколько стоит экран? Мой номер +7 999 123-45-67')
+        save.assert_called_once()
+        self.assertTrue(model.await_args.kwargs['lead_saved'])
+        self.assertIn('2500', self.msg.answer.await_args.args[0])

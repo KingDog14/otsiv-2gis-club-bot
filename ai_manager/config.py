@@ -21,8 +21,10 @@ class Settings:
     GIGACHAT_CREDENTIALS: str = os.getenv('GIGACHAT_CREDENTIALS', '')
     GSHEETS_CREDENTIALS_JSON: str = os.getenv('GSHEETS_CREDENTIALS_JSON', './gsheets.json')
     GSHEETS_SPREADSHEET_ID: str = os.getenv('GSHEETS_SPREADSHEET_ID', '')
-    COMPANY_NAME: str = os.getenv('COMPANY_NAME', 'Ваша компания')
+    COMPANY_NAME: str = os.getenv('COMPANY_NAME', 'Тестовая компания')
     KNOWLEDGE_PATH: str = os.getenv('KNOWLEDGE_PATH', './knowledge.txt')
+    BOT_SETUP_AVATAR: bool = os.getenv('BOT_SETUP_AVATAR', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    BOT_SETUP_PROFILE: bool = os.getenv('BOT_SETUP_PROFILE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     DB_PATH: str = os.getenv('DB_PATH', './manager.sqlite3')
 
     def validate(self):

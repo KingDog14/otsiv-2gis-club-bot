@@ -8,6 +8,7 @@ from db import repos
 
 router = Router()
 sessions = {}
+test_mode = set()
 
 
 def owner(message):
@@ -30,6 +31,7 @@ def home_view():
             f'🔔 Ожидают менеджера: {active}\n📊 Всего обращений к менеджеру: {escalations}\n\n'
             'Выберите раздел. Для обновления нажмите «Обновить».')
     return text, markup([button('🔔 Обращения', 'admin:queue:0'), button('📋 Лиды', 'admin:leads')],
+                        [button('🧪 Тестировать как клиент', 'admin:test')],
                         [button('🔄 Обновить', 'admin:home')])
 
 
@@ -100,12 +102,37 @@ async def edit(callback, view):
 @router.message(CommandStart(), F.func(owner))
 async def start(message: Message):
     sessions.pop(message.from_user.id, None)
+    test_mode.discard(message.from_user.id)
     text, keyboard = home_view()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.message(Command('panel'), F.func(owner))
+async def panel(message: Message):
+    await start(message)
+
+
+def test_view():
+    return ('🧪 Тестирование агента\n\n'
+            'Вы будете общаться с ботом как клиент. Внимание: лиды записываются в Google Sheets, '
+            'а эскалации и история сохраняются по-настоящему. Используйте только тестовые данные.\n\n'
+            'Выйти можно командой /panel. Если обращение передано менеджеру, завершите его в разделе «Обращения».',
+            markup([button('▶️ Начать реальный тест', 'admin:test:start')],
+                   [button('🏠 Главное меню', 'admin:home')]))
+
+
+@router.message(Command('test'), F.func(owner))
+async def test_command(message: Message):
+    sessions.pop(message.from_user.id, None)
+    test_mode.discard(message.from_user.id)
+    text, keyboard = test_view()
     await message.answer(text, reply_markup=keyboard)
 
 
 @router.message(Command('leads'), F.func(owner))
 async def leads(message: Message):
+    sessions.pop(message.from_user.id, None)
+    test_mode.discard(message.from_user.id)
     text, keyboard = leads_view()
     await message.answer(text, reply_markup=keyboard)
 
@@ -117,20 +144,37 @@ async def navigation(callback: CallbackQuery, bot: Bot):
         return
     data = callback.data
     try:
-        if data == 'admin:home':
+        if data == 'admin:test':
+            sessions.pop(callback.from_user.id, None)
+            test_mode.discard(callback.from_user.id)
+            view = test_view()
+        elif data == 'admin:test:start':
+            sessions.pop(callback.from_user.id, None)
+            test_mode.add(callback.from_user.id)
+            view = ('🧪 Реальный тест включён. Напишите вопрос или отправьте свой контакт. '
+                    'Лиды и эскалации будут настоящими. Для выхода нажмите кнопку ниже или /panel.',
+                    markup([button('🛠 Услуги и цены', 'client:prices'), button('🕒 Время работы', 'client:hours')],
+                           [button('👤 Позвать менеджера', 'client:human')],
+                           [button('🏠 Выйти в панель', 'admin:home')]))
+        elif data == 'admin:home':
+            test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             view = home_view()
         elif data == 'admin:leads':
+            test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             view = leads_view()
         elif data.startswith('admin:queue:'):
+            test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             view = queue_view(int(data.rsplit(':', 1)[1]))
         elif data.startswith('admin:dialog:'):
+            test_mode.discard(callback.from_user.id)
             tg_id = int(data.rsplit(':', 1)[1])
             sessions.pop(callback.from_user.id, None)
             view = dialog_view(tg_id)
         elif data.startswith(('admin:write:', 'reply:')):
+            test_mode.discard(callback.from_user.id)
             tg_id = int(data.rsplit(':', 1)[1])
             if not repos.is_escalated(tg_id):
                 await callback.answer('Обращение уже завершено', show_alert=True)
@@ -139,6 +183,7 @@ async def navigation(callback: CallbackQuery, bot: Bot):
             sessions[callback.from_user.id] = (tg_id, callback.message.chat.id, callback.message.message_id)
             view = dialog_view(tg_id, '✍️ Напишите сообщение клиенту. Чтобы отменить, выберите другой раздел.')
         elif data.startswith('end:'):
+            test_mode.discard(callback.from_user.id)
             tg_id = int(data.rsplit(':', 1)[1])
             if not repos.is_escalated(tg_id):
                 await callback.answer('Обращение уже завершено', show_alert=True)
@@ -162,6 +207,10 @@ async def navigation(callback: CallbackQuery, bot: Bot):
 
 @router.message(F.func(owner), F.text)
 async def owner_message(message: Message, bot: Bot):
+    if message.from_user.id in test_mode:
+        from bot.handlers.client import process_client
+        await process_client(message, bot, message.text)
+        return
     session = sessions.get(message.from_user.id)
     if not session:
         await message.answer('Откройте панель командой /start и выберите обращение.')
@@ -185,6 +234,18 @@ async def owner_message(message: Message, bot: Bot):
     except TelegramBadRequest:
         logging.exception('Could not update owner panel')
         await message.answer('Отправлено. Откройте панель: /start')
+
+
+@router.message(F.func(owner), F.contact)
+async def owner_contact(message: Message, bot: Bot):
+    if message.from_user.id in test_mode:
+        from bot.handlers.client import process_client
+        if message.contact.user_id and message.contact.user_id != message.from_user.id:
+            await message.answer('Отправьте свой контакт, не контакт другого человека.')
+            return
+        await process_client(message, bot, f'Контакт: {message.contact.phone_number}', message.contact.phone_number)
+    else:
+        await message.answer('Панель управления: /start')
 
 
 @router.message(F.func(owner))
