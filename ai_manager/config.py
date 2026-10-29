@@ -30,6 +30,10 @@ class Settings:
         missing = [key for key in required if not getattr(self, key)]
         if missing:
             raise ValueError('Заполните в .env: ' + ', '.join(missing))
+        if not path_from_base(self.KNOWLEDGE_PATH).is_file():
+            raise ValueError('Файл базы знаний не найден: ' + str(path_from_base(self.KNOWLEDGE_PATH)))
+        if not path_from_base(self.GSHEETS_CREDENTIALS_JSON).is_file():
+            raise ValueError('Файл сервисного аккаунта не найден: ' + str(path_from_base(self.GSHEETS_CREDENTIALS_JSON)))
 
 
 settings = Settings()

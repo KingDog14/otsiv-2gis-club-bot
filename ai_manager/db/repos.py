@@ -61,3 +61,22 @@ def stats():
 def recent_leads():
     with connect() as db:
         return db.execute('SELECT created_at, tg_id, username, contact, question, intent FROM leads ORDER BY id DESC LIMIT 10').fetchall()
+
+
+def active_conversations(limit=10, offset=0):
+    with connect() as db:
+        return db.execute('''SELECT c.tg_id, c.username,
+            (SELECT content FROM messages m WHERE m.tg_id=c.tg_id AND m.role='user' ORDER BY m.id DESC LIMIT 1)
+            FROM conversations c WHERE c.escalated=1
+            ORDER BY (SELECT MAX(id) FROM messages m WHERE m.tg_id=c.tg_id) DESC
+            LIMIT ? OFFSET ?''', (limit, offset)).fetchall()
+
+
+def active_count():
+    with connect() as db:
+        return db.execute('SELECT COUNT(*) FROM conversations WHERE escalated=1').fetchone()[0]
+
+
+def conversation(tg_id):
+    with connect() as db:
+        return db.execute('SELECT tg_id, username, escalated FROM conversations WHERE tg_id=?', (tg_id,)).fetchone()
