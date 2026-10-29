@@ -80,3 +80,15 @@ def active_count():
 def conversation(tg_id):
     with connect() as db:
         return db.execute('SELECT tg_id, username, escalated FROM conversations WHERE tg_id=?', (tg_id,)).fetchone()
+
+
+def panel_for(owner_id):
+    with connect() as db:
+        return db.execute('SELECT chat_id, message_id FROM admin_panel WHERE owner_id=?', (owner_id,)).fetchone()
+
+
+def save_panel(owner_id, chat_id, message_id):
+    with connect() as db:
+        db.execute('INSERT INTO admin_panel(owner_id, chat_id, message_id) VALUES (?, ?, ?) '
+                   'ON CONFLICT(owner_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id',
+                   (owner_id, chat_id, message_id))

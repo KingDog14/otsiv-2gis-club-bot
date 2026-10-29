@@ -9,6 +9,7 @@ from bot.handlers import client, manager
 
 async def main():
     settings.validate()
+    logging.info('GigaChat model: %s', settings.GIGACHAT_MODEL)
     init_db()
     dp = Dispatcher()
     dp.include_router(manager.router)
