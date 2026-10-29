@@ -1,2 +1,3 @@
-# otsiv-2gis-club-bot
-The clubs bot
+# AI-администратор входящих
+
+Прототип находится в [ai_manager](ai_manager/README.md). Инструкция по настройке и запуску — в его README.
