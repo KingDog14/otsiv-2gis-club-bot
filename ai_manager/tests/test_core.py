@@ -27,7 +27,8 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         from gigachat.models import Messages, MessagesRole
         tool_response.choices[0].message = Messages(role=MessagesRole.ASSISTANT, content='', function_call={'name': 'search_knowledge', 'arguments': {'query': 'кружка'}})
         with patch.object(assistant, 'chat', side_effect=[tool_response, final_response]), patch.object(assistant, 'execute_tool', new=AsyncMock(return_value='{"status":"success"}')):
-            messages, answer = await assistant.prepare(None, 1, None, [], 'цена?')
+            answer = await assistant.prepare(None, 1, None, [], 'цена?')
+            messages = assistant.chat.call_args_list[1].args[0].messages
         self.assertEqual(answer, '900 рублей')
         self.assertEqual(messages[-1].role, 'function')
         self.assertEqual(messages[-1].name, 'search_knowledge')

@@ -1,7 +1,5 @@
 import asyncio
 import json
-import logging
-import threading
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from config import settings
@@ -46,37 +44,11 @@ async def prepare(bot, tg_id, username, history, text):
             messages.append(choice.message)
             messages.append(Messages(role=MessagesRole.FUNCTION, content=result, name=call.name))
         elif choice.finish_reason == 'stop':
-            return messages, choice.message.content or ''
+            answer = choice.message.content or ''
+            if not answer.strip():
+                raise RuntimeError('Пустой ответ GigaChat')
+            return answer
         else:
             raise RuntimeError(f'Неожиданный finish_reason: {choice.finish_reason}')
     raise RuntimeError('Превышен лимит вызовов инструментов')
 
-
-async def stream_final(messages):
-    # A second generation is necessary for streaming; disable functions so it cannot
-    # emit another tool call. If it fails, the caller uses the already checked answer.
-    payload = Chat(messages=messages, function_call='none')
-    queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-
-    def worker():
-        try:
-            with build_client() as client:
-                for chunk in client.stream(payload):
-                    text = getattr(getattr(chunk.choices[0], 'delta', None), 'content', None) if chunk.choices else None
-                    if text:
-                        loop.call_soon_threadsafe(queue.put_nowait, ('chunk', text))
-        except Exception as exc:
-            logging.exception('GigaChat streaming failed')
-            loop.call_soon_threadsafe(queue.put_nowait, ('error', exc))
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, ('done', None))
-
-    threading.Thread(target=worker, daemon=True).start()
-    while True:
-        kind, value = await queue.get()
-        if kind == 'done':
-            break
-        if kind == 'error':
-            raise value
-        yield value
