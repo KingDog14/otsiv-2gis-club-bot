@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+gigachat>=0.1.39,<1
+gspread>=6,<7
+python-dotenv>=1,<2
