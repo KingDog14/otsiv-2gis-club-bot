@@ -19,6 +19,8 @@ class FakeSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if method.__class__.__name__ == 'SendMessage':
+            return SimpleNamespace(message_id=100 + len(self.calls))
         return True
 
     async def close(self):
@@ -54,5 +56,12 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
             await dp.feed_update(bot, Update(update_id=2, message=msg))
             model.assert_awaited_once()
             self.assertIn('Гарантия три месяца.', [getattr(method, 'text', '') for method in session.calls])
+            # Reopening the dashboard replaces the previous bot panel, not the user's messages.
+            for update_id in (3, 4):
+                start = Message(message_id=10 + update_id, date=datetime.now(timezone.utc), chat=chat, from_user=user, text='/start')
+                await dp.feed_update(bot, Update(update_id=update_id, message=start))
+            deletes = [method.message_id for method in session.calls if method.__class__.__name__ == 'DeleteMessage']
+            self.assertIn(10, deletes)
+            self.assertEqual(len(deletes), 2)
             manager.test_mode.clear()
             await bot.session.close()

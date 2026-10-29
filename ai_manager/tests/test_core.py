@@ -13,8 +13,9 @@ import tempfile
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_search_and_human(self):
-        self.assertIn('2500', ' '.join(tools.search_knowledge('замена экрана смартфона')['results']))
-        self.assertEqual(tools.search_knowledge('квазичастица')['status'], 'empty')
+        with patch.object(tools.gsheets, 'context', return_value=''):
+            self.assertIn('2500', ' '.join(tools.search_knowledge('замена экрана смартфона')['results']))
+            self.assertEqual(tools.search_knowledge('квазичастица')['status'], 'empty')
         for text in ('Позовите человека', 'оператор', 'менеджер'):
             self.assertTrue(HUMAN.search(text))
 
@@ -26,9 +27,10 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         # Real SDK models are required when the assistant message is inserted into Chat.
         from gigachat.models import Messages, MessagesRole
         tool_response.choices[0].message = Messages(role=MessagesRole.ASSISTANT, content='', function_call={'name': 'search_knowledge', 'arguments': {'query': 'кружка'}})
-        with patch.object(assistant, 'chat', side_effect=[tool_response, final_response]), patch.object(assistant, 'execute_tool', new=AsyncMock(return_value='{"status":"success"}')):
+        with patch.object(assistant, 'chat', side_effect=[tool_response, final_response]), patch.object(assistant.gsheets, 'context', return_value=''), patch.object(assistant, 'execute_tool', new=AsyncMock(return_value='{"status":"success"}')):
             answer = await assistant.prepare(None, 1, None, [], 'цена?')
             messages = assistant.chat.call_args_list[1].args[0].messages
+            self.assertEqual(assistant.chat.call_args_list[0].args[0].model, settings.GIGACHAT_MODEL)
         self.assertEqual(answer, '900 рублей')
         self.assertEqual(messages[-1].role, 'function')
         self.assertEqual(messages[-1].name, 'search_knowledge')
@@ -54,7 +56,7 @@ if __name__ == '__main__':
 class AgentContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_lead_already_saved_disables_save_tool_and_keeps_history(self):
         response = SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content='От 2500 рублей.'))])
-        with patch.object(assistant, 'chat', return_value=response) as chat:
+        with patch.object(assistant, 'chat', return_value=response) as chat, patch.object(assistant.gsheets, 'context', return_value=''):
             answer = await assistant.prepare(None, 1, None, [('user', 'У меня смартфон')], 'Цена? +7 999 123-45-67', lead_saved=True)
         payload = chat.call_args.args[0]
         self.assertEqual(answer, 'От 2500 рублей.')

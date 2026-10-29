@@ -19,6 +19,7 @@ class Settings:
     OWNER_TG_ID: int = int(os.getenv('OWNER_TG_ID', '0'))
     GIGACHAT_BASE_URL: str = os.getenv('GIGACHAT_BASE_URL', 'https://api.giga.chat/v1')
     GIGACHAT_CREDENTIALS: str = os.getenv('GIGACHAT_CREDENTIALS', '')
+    GIGACHAT_MODEL: str = os.getenv('GIGACHAT_MODEL', 'GigaChat-2').strip()
     GSHEETS_CREDENTIALS_JSON: str = os.getenv('GSHEETS_CREDENTIALS_JSON', './gsheets.json')
     GSHEETS_SPREADSHEET_ID: str = os.getenv('GSHEETS_SPREADSHEET_ID', '')
     COMPANY_NAME: str = os.getenv('COMPANY_NAME', 'Тестовая компания')
@@ -28,7 +29,7 @@ class Settings:
     DB_PATH: str = os.getenv('DB_PATH', './manager.sqlite3')
 
     def validate(self):
-        required = ('BOT_TOKEN', 'OWNER_TG_ID', 'GIGACHAT_CREDENTIALS', 'GSHEETS_CREDENTIALS_JSON', 'GSHEETS_SPREADSHEET_ID')
+        required = ('BOT_TOKEN', 'OWNER_TG_ID', 'GIGACHAT_CREDENTIALS', 'GIGACHAT_MODEL', 'GSHEETS_CREDENTIALS_JSON', 'GSHEETS_SPREADSHEET_ID')
         missing = [key for key in required if not getattr(self, key)]
         if missing:
             raise ValueError('Заполните в .env: ' + ', '.join(missing))

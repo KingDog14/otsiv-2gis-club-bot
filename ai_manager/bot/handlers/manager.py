@@ -1,22 +1,27 @@
 import logging
+import asyncio
+import secrets
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from config import settings
 from db import repos
+from core import gsheets
 
 router = Router()
 sessions = {}
 test_mode = set()
+catalog_modes = {}
+pending_changes = {}
 
 
 def owner(message):
     return bool(message.from_user and message.from_user.id == settings.OWNER_TG_ID and message.chat.type == 'private')
 
 
-def button(text, data):
-    return InlineKeyboardButton(text=text, callback_data=data)
+def button(text, data, style=None):
+    return InlineKeyboardButton(text=text, callback_data=data, style=style)
 
 
 def markup(*rows):
@@ -26,13 +31,14 @@ def markup(*rows):
 def home_view():
     dialogs, leads, escalations = repos.stats()
     active = repos.active_count()
-    text = (f'🏠 Панель администратора · {settings.COMPANY_NAME}\n\n'
-            f'💬 Диалогов: {dialogs}\n📋 Лидов: {leads}\n'
-            f'🔔 Ожидают менеджера: {active}\n📊 Всего обращений к менеджеру: {escalations}\n\n'
-            'Выберите раздел. Для обновления нажмите «Обновить».')
-    return text, markup([button('🔔 Обращения', 'admin:queue:0'), button('📋 Лиды', 'admin:leads')],
-                        [button('🧪 Тестировать как клиент', 'admin:test')],
-                        [button('🔄 Обновить', 'admin:home')])
+    text = (f'🏠 {settings.COMPANY_NAME} · Управление\n\n'
+            f'💬 Диалоги: {dialogs}   ·   📋 Заявки: {leads}\n'
+            f'🔔 Нужен ответ: {active}\n\n'
+            'Выберите раздел или проверьте, как отвечает бот.')
+    return text, markup([button(f'🔔 Требуют ответа · {active}', 'admin:queue:0'), button(f'📋 Заявки · {leads}', 'admin:leads')],
+                        [button('🧪 Проверить бота', 'admin:test', 'success')],
+                        [button('🗂 Услуги и новости', 'admin:catalog', 'primary')],
+                        [button('↻ Обновить', 'admin:home')])
 
 
 def queue_view(page):
@@ -99,42 +105,94 @@ async def edit(callback, view):
             raise
 
 
+async def adopt_panel(bot, owner_id, chat_id, message_id):
+    """Keep one current panel, without deleting client/owner messages or alerts."""
+    old = repos.panel_for(owner_id)
+    repos.save_panel(owner_id, chat_id, message_id)
+    if old and old != (chat_id, message_id):
+        try:
+            await bot.delete_message(chat_id=old[0], message_id=old[1])
+        except Exception:
+            # Old messages may no longer be deletable; remove stale controls if possible.
+            try:
+                await bot.edit_message_reply_markup(chat_id=old[0], message_id=old[1], reply_markup=None)
+            except Exception:
+                logging.warning('Could not remove previous admin panel', exc_info=True)
+
+
+async def show_panel(message, bot, view):
+    text, keyboard = view
+    sent = await message.answer(text, reply_markup=keyboard)
+    await adopt_panel(bot, message.from_user.id, message.chat.id, sent.message_id)
+
+
 @router.message(CommandStart(), F.func(owner))
-async def start(message: Message):
+@router.message(Command('panel'), F.func(owner))
+async def start(message: Message, bot: Bot):
     sessions.pop(message.from_user.id, None)
     test_mode.discard(message.from_user.id)
-    text, keyboard = home_view()
-    await message.answer(text, reply_markup=keyboard)
-
-
-@router.message(Command('panel'), F.func(owner))
-async def panel(message: Message):
-    await start(message)
+    catalog_modes.pop(message.from_user.id, None)
+    pending_changes.pop(message.from_user.id, None)
+    await show_panel(message, bot, home_view())
 
 
 def test_view():
-    return ('🧪 Тестирование агента\n\n'
-            'Вы будете общаться с ботом как клиент. Внимание: лиды записываются в Google Sheets, '
-            'а эскалации и история сохраняются по-настоящему. Используйте только тестовые данные.\n\n'
-            'Выйти можно командой /panel. Если обращение передано менеджеру, завершите его в разделе «Обращения».',
-            markup([button('▶️ Начать реальный тест', 'admin:test:start')],
-                   [button('🏠 Главное меню', 'admin:home')]))
+    return ('🧪 Проверка бота\n\n'
+            'Напишите вопрос так, как его задал бы клиент. Бот учтёт переписку и ответит здесь.\n\n'
+            'Важно: контакты и обращения сохраняются по-настоящему. Используйте тестовые данные.',
+            markup([button('← Вернуться к управлению', 'admin:home')]))
 
 
 @router.message(Command('test'), F.func(owner))
-async def test_command(message: Message):
+async def test_command(message: Message, bot: Bot):
     sessions.pop(message.from_user.id, None)
-    test_mode.discard(message.from_user.id)
-    text, keyboard = test_view()
-    await message.answer(text, reply_markup=keyboard)
+    catalog_modes.pop(message.from_user.id, None)
+    pending_changes.pop(message.from_user.id, None)
+    test_mode.add(message.from_user.id)
+    await show_panel(message, bot, test_view())
 
 
 @router.message(Command('leads'), F.func(owner))
-async def leads(message: Message):
+async def leads(message: Message, bot: Bot):
+    catalog_modes.pop(message.from_user.id, None)
+    pending_changes.pop(message.from_user.id, None)
     sessions.pop(message.from_user.id, None)
     test_mode.discard(message.from_user.id)
-    text, keyboard = leads_view()
-    await message.answer(text, reply_markup=keyboard)
+    await show_panel(message, bot, leads_view())
+
+
+def catalog_view(data, note=''):
+    lines = ['🗂 Услуги и новости', '', 'Данные из Google Sheets · только активные записи']
+    services = data['Services']
+    news = data['News']
+    lines.append('\nУслуги:')
+    lines.extend(f"• {r['name'][:100]} — {r['price'][:80]}" for r in services[:8])
+    if not services:
+        lines.append('Пока нет записей')
+    if len(services) > 8:
+        lines.append(f'… и ещё {len(services) - 8}')
+    lines.append('\nНовости:')
+    lines.extend(f"• {r['title'][:120]}" for r in news[:5])
+    if not news:
+        lines.append('Пока нет записей')
+    if note:
+        lines.extend(['', note])
+    return '\n'.join(lines)[:4000], markup(
+        [button('＋ Услуга', 'admin:add:Services', 'success'), button('＋ Новость', 'admin:add:News', 'success')],
+        [button('✏️ Изменить цену', 'admin:add:Price', 'primary'), button('✏️ Изменить новость', 'admin:add:NewsEdit', 'primary')],
+        [button('↻ Обновить', 'admin:catalog'), button('← Назад', 'admin:home')])
+
+
+def input_view(kind):
+    examples = {
+        'Services': 'название | цена | описание\nНапример: Диагностика | 500 ₽ | Бесплатно при ремонте',
+        'News': 'заголовок | текст\nНапример: График | 1 мая работаем до 16:00',
+        'Price': 'название услуги | новая цена\nНапример: Диагностика | 600 ₽',
+        'NewsEdit': 'заголовок новости | новый текст\nНапример: График | Работаем до 18:00',
+    }
+    return ('✍️ Отправьте одной строкой:\n\n' + examples[kind] +
+            '\n\nИзменение будет показано для подтверждения.',
+            markup([button('← Отмена', 'admin:catalog')]))
 
 
 @router.callback_query(F.data.startswith('admin:') | F.data.startswith('reply:') | F.data.startswith('end:'))
@@ -143,20 +201,72 @@ async def navigation(callback: CallbackQuery, bot: Bot):
         await callback.answer('Нет доступа', show_alert=True)
         return
     data = callback.data
+    if not (data.startswith('admin:add:') or data.startswith('admin:confirm:')):
+        catalog_modes.pop(callback.from_user.id, None)
+        pending_changes.pop(callback.from_user.id, None)
     try:
-        if data == 'admin:test':
-            sessions.pop(callback.from_user.id, None)
+        if data == 'admin:catalog':
             test_mode.discard(callback.from_user.id)
-            view = test_view()
-        elif data == 'admin:test:start':
+            sessions.pop(callback.from_user.id, None)
+            catalog_modes.pop(callback.from_user.id, None)
+            pending_changes.pop(callback.from_user.id, None)
+            try:
+                catalog_data = await asyncio.to_thread(gsheets.catalog)
+                view = catalog_view(catalog_data)
+            except Exception:
+                logging.exception('Catalog read failed')
+                view = ('Не удалось загрузить таблицу. Проверьте доступ и заголовки листов.',
+                        markup([button('↻ Повторить', 'admin:catalog'), button('← Назад', 'admin:home')]))
+        elif data.startswith('admin:add:'):
+            kind = data.rsplit(':', 1)[-1]
+            if kind not in ('Services', 'News', 'Price', 'NewsEdit'):
+                await callback.answer('Неизвестный раздел')
+                return
+            test_mode.discard(callback.from_user.id)
+            sessions.pop(callback.from_user.id, None)
+            pending_changes.pop(callback.from_user.id, None)
+            catalog_modes[callback.from_user.id] = (kind, callback.message.chat.id, callback.message.message_id)
+            view = input_view(kind)
+        elif data.startswith('admin:confirm:'):
+            pending = pending_changes.get(callback.from_user.id)
+            token = data.rsplit(':', 1)[-1]
+            if not pending or pending[0] != token:
+                await callback.answer('Подтверждение устарело', show_alert=True)
+                return
+            pending_changes.pop(callback.from_user.id, None)
+            catalog_modes.pop(callback.from_user.id, None)
+            _, kind, fields, expected = pending
+            try:
+                if kind == 'Price':
+                    await asyncio.to_thread(gsheets.update_price, fields[0], fields[1], expected)
+                elif kind == 'NewsEdit':
+                    await asyncio.to_thread(gsheets.update_news, fields[0], fields[1], expected)
+                else:
+                    await asyncio.to_thread(gsheets.add_entry, kind, fields)
+                note = '✅ Изменение сохранено в таблице.'
+            except Exception:
+                logging.exception('Catalog write failed')
+                note = '⚠️ Не удалось подтвердить запись. Проверьте таблицу перед повтором: при сбое сети запись могла сохраниться.'
+            try:
+                view = catalog_view(await asyncio.to_thread(gsheets.catalog), note)
+            except Exception:
+                view = (note, markup([button('← К каталогу', 'admin:catalog')]))
+        elif data == 'admin:test:resume':
+            # This button can only close the owner's own test conversation.
+            if repos.is_escalated(callback.from_user.id):
+                repos.set_escalated(callback.from_user.id, False)
             sessions.pop(callback.from_user.id, None)
             test_mode.add(callback.from_user.id)
-            view = ('🧪 Реальный тест включён. Напишите вопрос или отправьте свой контакт. '
-                    'Лиды и эскалации будут настоящими. Для выхода нажмите кнопку ниже или /panel.',
-                    markup([button('🛠 Услуги и цены', 'client:prices'), button('🕒 Время работы', 'client:hours')],
-                           [button('👤 Позвать менеджера', 'client:human')],
-                           [button('🏠 Выйти в панель', 'admin:home')]))
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.answer('Можно задать следующий вопрос')
+            return
+        elif data in ('admin:test', 'admin:test:start'):
+            sessions.pop(callback.from_user.id, None)
+            test_mode.add(callback.from_user.id)
+            view = test_view()
         elif data == 'admin:home':
+            catalog_modes.pop(callback.from_user.id, None)
+            pending_changes.pop(callback.from_user.id, None)
             test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             view = home_view()
@@ -200,6 +310,8 @@ async def navigation(callback: CallbackQuery, bot: Bot):
             await callback.answer('Неизвестная команда')
             return
         await edit(callback, view)
+        if data.startswith('admin:'):
+            await adopt_panel(bot, callback.from_user.id, callback.message.chat.id, callback.message.message_id)
         await callback.answer()
     except (ValueError, IndexError):
         await callback.answer('Некорректная команда')
@@ -207,6 +319,42 @@ async def navigation(callback: CallbackQuery, bot: Bot):
 
 @router.message(F.func(owner), F.text)
 async def owner_message(message: Message, bot: Bot):
+    if message.from_user.id in catalog_modes:
+        kind, chat_id, panel_id = catalog_modes[message.from_user.id]
+        fields = [field.strip() for field in message.text.split('|')]
+        count = {'Services': 3, 'News': 2, 'Price': 2, 'NewsEdit': 2}[kind]
+        if len(fields) != count or not all(fields) or any(len(field) > 1000 for field in fields):
+            await message.answer('Проверьте поля: разделите их символом |, заполните все поля (до 1000 символов).')
+            return
+        expected = None
+        if kind in ('Price', 'NewsEdit'):
+            try:
+                data = await asyncio.to_thread(gsheets.catalog)
+                rows = data['Services' if kind == 'Price' else 'News']
+                key = 'name' if kind == 'Price' else 'title'
+                found = [r for r in rows if r[key].strip().casefold() == fields[0].casefold()]
+                if len(found) != 1:
+                    await message.answer('Активная запись не найдена или название неоднозначно. Укажите точное название.')
+                    return
+                expected = found[0]['price' if kind == 'Price' else 'text']
+            except Exception:
+                logging.exception('Could not check price')
+                await message.answer('Не удалось проверить таблицу. Попробуйте позже.')
+                return
+        token = secrets.token_urlsafe(8)
+        pending_changes[message.from_user.id] = (token, kind, fields, expected)
+        catalog_modes.pop(message.from_user.id, None)
+        text = 'Проверьте перед сохранением:\n\n' + '\n'.join(fields)
+        if expected is not None:
+            text += f'\nТекущее значение: {expected}'
+        keyboard = markup([button('✅ Сохранить', f'admin:confirm:{token}', 'success'), button('Отмена', 'admin:catalog')])
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=panel_id, text=text[:4000], reply_markup=keyboard)
+        except Exception:
+            logging.exception('Could not show confirmation')
+            pending_changes.pop(message.from_user.id, None)
+            await message.answer('Не удалось показать подтверждение. Откройте /panel и повторите.')
+        return
     if message.from_user.id in test_mode:
         from bot.handlers.client import process_client
         await process_client(message, bot, message.text)
@@ -234,6 +382,15 @@ async def owner_message(message: Message, bot: Bot):
     except TelegramBadRequest:
         logging.exception('Could not update owner panel')
         await message.answer('Отправлено. Откройте панель: /start')
+
+
+@router.message(F.func(owner), F.photo | F.voice)
+async def owner_media(message: Message, bot: Bot):
+    if message.from_user.id in test_mode:
+        from bot.handlers.client import process_media
+        await process_media(message, bot)
+    else:
+        await message.answer('Для проверки фото или голоса откройте /test.')
 
 
 @router.message(F.func(owner), F.contact)

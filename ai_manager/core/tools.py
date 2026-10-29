@@ -21,6 +21,9 @@ def knowledge():
 def search_knowledge(query):
     words = [word[:5] for word in re.findall(r'\w+', query.lower()) if len(word) >= 3]
     paragraphs = re.split(r'\n\s*\n', knowledge())
+    # Sheet rows are separate searchable chunks and are refreshed at query time.
+    live = gsheets.context()
+    paragraphs = live.splitlines() + paragraphs
     ranked = sorted(((sum(5 for word in words if word in p.lower()), i, p) for i, p in enumerate(paragraphs)), key=lambda x: (-x[0], x[1]))
     matches = [p[:3000] for score, _, p in ranked if score > 0][:3]
     return {'status': 'success', 'results': matches} if matches else {'status': 'empty'}
@@ -40,6 +43,20 @@ async def escalate(bot, tg_id, username, reason):
     repos.set_escalated(tg_id, True, reason)
 
 
+async def save_lead(bot, tg_id, username, contact, question, intent='consult'):
+    # Persist first; notification failure must not be reported as a failed save.
+    await asyncio.to_thread(gsheets.save, tg_id, username, contact, question, intent)
+    repos.add_lead(tg_id, username, contact, question, intent)
+    label = f'@{username}' if username else str(tg_id)
+    text = f'📋 Новая заявка\nКлиент: {label} ({tg_id})\nКонтакт: {contact[:250]}\nЗапрос: {question[:1000]}\nИнтерес: {intent[:50]}'
+    try:
+        await bot.send_message(settings.OWNER_TG_ID, text[:4000], reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text='📋 Открыть заявки', callback_data='admin:leads')]]))
+    except Exception:
+        import logging
+        logging.exception('Lead was saved but owner notification failed')
+
+
 async def execute_tool(name, args, bot, tg_id, username):
     try:
         if name == 'search_knowledge':
@@ -47,8 +64,7 @@ async def execute_tool(name, args, bot, tg_id, username):
         elif name == 'save_lead':
             contact, question = args['contact'], args['question']
             intent = args.get('intent', 'other')
-            await asyncio.to_thread(gsheets.save, tg_id, username, contact, question, intent)
-            repos.add_lead(tg_id, username, contact, question, intent)
+            await save_lead(bot, tg_id, username, contact, question, intent)
             result = {'status': 'success'}
         elif name == 'escalate_to_human':
             await escalate(bot, tg_id, username, args['reason'])
@@ -58,7 +74,7 @@ async def execute_tool(name, args, bot, tg_id, username):
     except Exception:
         import logging
         logging.exception('Tool failed: %s', name)
-        if name in ('save_lead', 'escalate_to_human'):
+        if name in ('search_knowledge', 'save_lead', 'escalate_to_human'):
             raise
         result = {'status': 'error', 'message': 'Не удалось выполнить действие; передай запрос менеджеру, не утверждай, что действие выполнено.'}
     return json.dumps(result, ensure_ascii=False)

@@ -4,11 +4,11 @@ import re
 from collections import defaultdict
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from types import SimpleNamespace
-from config import settings
-from core import assistant, gsheets
-from core.tools import escalate, keyboard
+from config import settings, BASE
+from core import assistant, media
+from core.tools import escalate, keyboard, save_lead
 from db import repos
 
 router = Router()
@@ -31,7 +31,12 @@ def extract_contact(text):
 
 async def send_and_record(message, tg_id, text):
     text = text[:4000]
-    await message.answer(text)
+    if tg_id == settings.OWNER_TG_ID and repos.is_escalated(tg_id):
+        display = text[:3800] + '\n\nЧтобы задать следующий вопрос, завершите тестовое обращение кнопкой ниже.'
+        await message.answer(display, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='Продолжить проверку', callback_data='admin:test:resume')]]))
+    else:
+        await message.answer(text)
     repos.add_message(tg_id, 'assistant', text)
 
 
@@ -40,15 +45,18 @@ async def client_start(message: Message):
     if message.from_user.id == settings.OWNER_TG_ID:
         return
     repos.ensure_conversation(message.from_user.id, message.from_user.username)
-    await message.answer(
-        f'Здравствуйте! Я администратор {settings.COMPANY_NAME}.\n\n'
-        'Расскажу об услугах и условиях, помогу оформить обращение или подключу менеджера. '
-        'Напишите вопрос или выберите тему:',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='🛠 Услуги и цены', callback_data='client:prices'),
-             InlineKeyboardButton(text='🕒 Время работы', callback_data='client:hours')],
-            [InlineKeyboardButton(text='👤 Позвать менеджера', callback_data='client:human')],
-        ]))
+    text = (f'🛠 {settings.COMPANY_NAME}\n\n'
+            'Поможем разобраться с услугами и стоимостью. Опишите задачу или задайте вопрос — ответим по делу.')
+    menu = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Оставить заявку', callback_data='client:order', style='success')],
+        [InlineKeyboardButton(text='Услуги и цены', callback_data='client:prices', style='primary'),
+         InlineKeyboardButton(text='Задать вопрос', callback_data='client:question')],
+    ])
+    try:
+        await message.answer_photo(FSInputFile(BASE / 'assets' / 'description-picture.jpg'), caption=text, reply_markup=menu)
+    except Exception:
+        logging.exception('Unable to send welcome image')
+        await message.answer(text, reply_markup=menu)
 
 
 async def process_client(message, bot, text, contact=None):
@@ -66,8 +74,7 @@ async def process_client(message, bot, text, contact=None):
             if contact:
                 question = next((content for role, content in reversed(history) if role == 'user'), text)
                 try:
-                    await asyncio.to_thread(gsheets.save, tg_id, username, contact, question, 'consult')
-                    repos.add_lead(tg_id, username, contact, question, 'consult')
+                    await save_lead(bot, tg_id, username, contact, question)
                     saved = True
                 except Exception:
                     logging.exception('Failed to save lead while escalated')
@@ -92,8 +99,7 @@ async def process_client(message, bot, text, contact=None):
                 if provided_contact:
                     question = next((content for role, content in reversed(history) if role == 'user'), text)
                     try:
-                        await asyncio.to_thread(gsheets.save, tg_id, username, provided_contact, question, 'consult')
-                        repos.add_lead(tg_id, username, provided_contact, question, 'consult')
+                        await save_lead(bot, tg_id, username, provided_contact, question)
                         answer = 'Контакт сохранён, ваш запрос передан менеджеру.'
                     except Exception:
                         logging.exception('Failed to save contact in human request')
@@ -107,15 +113,16 @@ async def process_client(message, bot, text, contact=None):
         if contact:
             question = text if QUESTION.search(text) else next((content for role, content in reversed(history) if role == 'user'), text)
             try:
-                await asyncio.to_thread(gsheets.save, tg_id, username, contact, question, 'consult')
-                repos.add_lead(tg_id, username, contact, question, 'consult')
+                await save_lead(bot, tg_id, username, contact, question)
                 answer = 'Спасибо! Ваш контакт сохранён.'
-                if QUESTION.search(text):
-                    try:
-                        detail = await assistant.prepare(bot, tg_id, username, history, text, lead_saved=True)
+                try:
+                    # Continue with the same context even when the message only contains a contact.
+                    detail = await assistant.prepare(bot, tg_id, username, history, text, lead_saved=True)
+                    if detail.strip():
                         answer += '\n\n' + detail
-                    except Exception:
-                        logging.exception('Failed to answer after saving contact')
+                except Exception:
+                    logging.exception('Failed to respond after saving contact')
+                    if QUESTION.search(text):
                         try:
                             if not repos.is_escalated(tg_id):
                                 await escalate(bot, tg_id, username, 'Не удалось ответить на вопрос после сохранения контакта')
@@ -123,8 +130,6 @@ async def process_client(message, bot, text, contact=None):
                         except Exception:
                             logging.exception('Failed to escalate after saving contact')
                             answer += ' Не удалось передать вопрос менеджеру; попробуйте позже.'
-                else:
-                    answer += ' Опишите технику и проблему, если ещё не рассказали о них.'
             except Exception:
                 logging.exception('Failed to save lead')
                 try:
@@ -159,9 +164,15 @@ async def shortcut(callback: CallbackQuery, bot: Bot):
         if callback.from_user.id not in test_mode:
             await callback.answer('Для тестирования откройте /test.', show_alert=True)
             return
-    queries = {'client:prices': 'Какие услуги и цены?',
+    queries = {'client:cost': 'Хочу узнать стоимость. Что нужно уточнить?',
+               'client:order': 'Хочу оставить заявку. Как это сделать?',
+               'client:prices': 'Какие услуги и цены?',
                'client:hours': 'Какой режим работы?',
                'client:human': 'Позовите менеджера'}
+    if callback.data == 'client:question':
+        await callback.answer()
+        await callback.message.answer('Напишите ваш вопрос здесь — можно подробно, своими словами.')
+        return
     text = queries.get(callback.data)
     if text is None:
         await callback.answer('Неизвестная команда')
@@ -170,6 +181,29 @@ async def shortcut(callback: CallbackQuery, bot: Bot):
     # Use the clicking user's identity; callback.message was sent by the bot.
     proxy = SimpleNamespace(from_user=callback.from_user, answer=callback.message.answer)
     await process_client(proxy, bot, text)
+
+
+async def process_media(message, bot):
+    kind = 'photo' if message.photo else 'voice'
+    attachment = message.photo[-1] if message.photo else message.voice
+    try:
+        description = await media.extract(bot, attachment, kind)
+    except Exception:
+        logging.exception('Could not process incoming media')
+        await message.answer('Не удалось разобрать файл. Пожалуйста, напишите вопрос текстом или отправьте файл размером до 8 МБ.')
+        return
+    label = 'Описание фото' if kind == 'photo' else 'Распознанная речь'
+    caption = (message.caption or '').strip()
+    text = f'{label}: {description}'
+    if caption:
+        text += f'\nКомментарий клиента: {caption}'
+    await process_client(message, bot, text)
+
+
+@router.message(F.chat.type == 'private', F.photo | F.voice)
+async def client_media(message: Message, bot: Bot):
+    if message.from_user.id != settings.OWNER_TG_ID:
+        await process_media(message, bot)
 
 
 @router.message(F.chat.type == 'private', F.text)

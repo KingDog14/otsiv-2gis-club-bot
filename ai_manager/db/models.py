@@ -1,4 +1,7 @@
 SCHEMA = '''
+CREATE TABLE IF NOT EXISTS admin_panel (
+    owner_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS conversations (
     tg_id INTEGER PRIMARY KEY, username TEXT, escalated INTEGER NOT NULL DEFAULT 0
 );
