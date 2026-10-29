@@ -58,5 +58,7 @@ async def execute_tool(name, args, bot, tg_id, username):
     except Exception:
         import logging
         logging.exception('Tool failed: %s', name)
+        if name in ('save_lead', 'escalate_to_human'):
+            raise
         result = {'status': 'error', 'message': 'Не удалось выполнить действие; передай запрос менеджеру, не утверждай, что действие выполнено.'}
     return json.dumps(result, ensure_ascii=False)
