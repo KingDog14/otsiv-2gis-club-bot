@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from config import settings
 from db.repos import init_db
+from core.profile import configure_profile
 from bot.handlers import client, manager
 
 
@@ -13,6 +14,8 @@ async def main():
     dp.include_router(manager.router)
     dp.include_router(client.router)
     async with Bot(settings.BOT_TOKEN) as bot:
+        if settings.BOT_SETUP_PROFILE:
+            await configure_profile(bot)
         await dp.start_polling(bot)
 
 
