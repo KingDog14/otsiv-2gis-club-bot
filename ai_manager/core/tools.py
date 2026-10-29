@@ -34,10 +34,10 @@ def keyboard(tg_id):
 
 
 async def escalate(bot, tg_id, username, reason):
-    recent = repos.history(tg_id, 3)
-    lines = '\n'.join('— ' + content[:1000] for _, content in recent) or '— нет сообщений'
+    recent = repos.history(tg_id, 10)
+    lines = '\n'.join(('Клиент: ' if role == 'user' else 'Администратор: ') + content[:300] for role, content in recent) or '— нет сообщений'
     label = f'@{username}' if username else 'без username'
-    text = f'⚠️ Эскалация\nКлиент: {label} ({tg_id})\nПричина: {reason[:500]}\nПоследние 3 сообщения:\n{lines}'
+    text = f'⚠️ Эскалация\nКлиент: {label} ({tg_id})\nПричина: {reason[:500]}\nКонтекст диалога (до 10 сообщений):\n{lines}'
     # Mark only after delivery, allowing a retry if Telegram rejects the message.
     await bot.send_message(settings.OWNER_TG_ID, text[:4000], reply_markup=keyboard(tg_id))
     repos.set_escalated(tg_id, True, reason)
@@ -57,6 +57,24 @@ async def save_lead(bot, tg_id, username, contact, question, intent='consult'):
         logging.exception('Lead was saved but owner notification failed')
 
 
+def contact_was_shared(tg_id, contact):
+    """Do not allow model-generated or guessed contact details into the CRM."""
+    if not isinstance(contact, str) or not contact.strip() or len(contact) > 200:
+        return False
+    candidate = contact.strip().casefold()
+    digits = re.sub(r'\D', '', candidate)
+    for role, text in repos.history(tg_id, 10):
+        if role != 'user':
+            continue
+        if candidate in text.casefold():
+            return True
+        if 10 <= len(digits) <= 15:
+            for match in re.findall(r'\+?\d[\d ()\-]{8,}\d', text):
+                if re.sub(r'\D', '', match) == digits:
+                    return True
+    return False
+
+
 async def execute_tool(name, args, bot, tg_id, username):
     try:
         if name == 'search_knowledge':
@@ -64,8 +82,11 @@ async def execute_tool(name, args, bot, tg_id, username):
         elif name == 'save_lead':
             contact, question = args['contact'], args['question']
             intent = args.get('intent', 'other')
-            await save_lead(bot, tg_id, username, contact, question, intent)
-            result = {'status': 'success'}
+            if not contact_was_shared(tg_id, contact):
+                result = {'status': 'error', 'message': 'Контакт не найден в сообщениях клиента. Не выдумывай его, попроси контакт или передай диалог менеджеру.'}
+            else:
+                await save_lead(bot, tg_id, username, contact, question, intent)
+                result = {'status': 'success'}
         elif name == 'escalate_to_human':
             await escalate(bot, tg_id, username, args['reason'])
             result = {'status': 'success'}

@@ -200,3 +200,17 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repos.stats()[1], 1)
         self.assertFalse(repos.is_escalated(123))
         self.assertIn('сохранён', self.msg.answer.await_args.args[0])
+
+    async def test_buy_handoff_without_model_or_payment(self):
+        with patch.object(client.assistant, 'prepare', new=AsyncMock()) as model:
+            await client.process_client(self.msg, self.bot, 'Хочу купить')
+        model.assert_not_awaited()
+        self.assertTrue(repos.is_escalated(123))
+        self.assertIn('менеджеру', self.msg.answer.await_args.args[0])
+
+    async def test_buy_with_contact_is_saved_and_handed_off(self):
+        with patch.object(tools.gsheets, 'save') as save:
+            await client.process_client(self.msg, self.bot, 'Хочу оплатить, +7 999 123-45-67')
+        self.assertEqual(save.call_args.args[-1], 'buy')
+        self.assertTrue(repos.is_escalated(123))
+        self.assertEqual(repos.stats()[1], 1)

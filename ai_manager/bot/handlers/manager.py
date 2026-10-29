@@ -14,6 +14,8 @@ sessions = {}
 test_mode = set()
 catalog_modes = {}
 pending_changes = {}
+lead_tokens = {}
+selection_choices = {}
 
 
 def owner(message):
@@ -32,12 +34,12 @@ def home_view():
     dialogs, leads, escalations = repos.stats()
     active = repos.active_count()
     text = (f'🏠 {settings.COMPANY_NAME} · Управление\n\n'
-            f'💬 Диалоги: {dialogs}   ·   📋 Заявки: {leads}\n'
+            f'💬 Диалоги: {dialogs}   ·   📋 Записано ботом: {leads}\n'
             f'🔔 Нужен ответ: {active}\n\n'
             'Выберите раздел или проверьте, как отвечает бот.')
     return text, markup([button(f'🔔 Требуют ответа · {active}', 'admin:queue:0'), button(f'📋 Заявки · {leads}', 'admin:leads')],
                         [button('🧪 Проверить бота', 'admin:test', 'success')],
-                        [button('🗂 Услуги и новости', 'admin:catalog', 'primary')],
+                        [button('🗂 Услуги и контекст', 'admin:catalog', 'primary'), button('📊 Отчёт', 'admin:report')],
                         [button('↻ Обновить', 'admin:home')])
 
 
@@ -67,15 +69,50 @@ def queue_view(page):
     return '\n'.join(lines), markup(*buttons)
 
 
-def leads_view():
-    rows = repos.recent_leads()
-    lines = ['📋 Последние лиды', '']
+STATUS_LABELS = {'new': '🆕 Новая', 'in_progress': '🟡 В работе', 'done': '✅ Завершена', 'lost': '⚪️ Закрыта', 'Новая': '🆕 Новая', 'В работе': '🟡 В работе', 'Завершена': '✅ Завершена', 'Закрыта': '⚪️ Закрыта'}
+
+
+def leads_view(rows):
+    lead_tokens.clear()
+    lines = ['📋 Заявки · Google Sheets', '', 'Выберите заявку, чтобы изменить статус.']
+    buttons = []
     if not rows:
-        lines.append('Лидов пока нет.')
-    for date, tg_id, username, contact, question, intent in rows:
-        label = '@' + username if username else str(tg_id)
-        lines.append(f'{date} · {label}\nКонтакт: {contact[:120]}\nЗапрос: {question[:150]}\nИнтерес: {(intent or "other")[:30]}\n')
-    return '\n'.join(lines)[:4000], markup([button('🔄 Обновить', 'admin:leads'), button('🏠 Главное меню', 'admin:home')])
+        lines.append('\nПока нет заявок.')
+    for row in rows:
+        values = row['values']
+        token = secrets.token_urlsafe(6)
+        lead_tokens[token] = row
+        label = ('@' + values[2]) if values[2] else (values[1] or 'Клиент')
+        status = STATUS_LABELS.get(values[6], values[6] or 'Без статуса')
+        lines.append(f"\n{label[:40]} · {status[:40]}\n{values[4][:100]}")
+        buttons.append([button(f'{label[:30]} · {status[:20]}'[:60], f'admin:lead:{token}')])
+    buttons.append([button('↻ Обновить', 'admin:leads'), button('← Назад', 'admin:home')])
+    return '\n'.join(lines)[:4000], markup(*buttons)
+
+
+def lead_view(token, snapshot, note=''):
+    date, tg_id, username, contact, question, intent, status = snapshot['values']
+    label = '@' + username if username else tg_id or 'Клиент'
+    text = (f'📋 Заявка · {label[:100]}\n\n'
+            f'🕒 {date[:80]}\n📞 {contact[:150]}\n'
+            f'💬 {question[:1200]}\n🎯 {intent[:100]}\n'
+            f'Статус: {STATUS_LABELS.get(status, status or "Без статуса")}')
+    if note:
+        text += '\n\n' + note
+    return text[:4000], markup(
+        [button('🟡 В работу', f'admin:status:{token}:in_progress', 'primary'),
+         button('✅ Завершена', f'admin:status:{token}:done', 'success')],
+        [button('🆕 Новая', f'admin:status:{token}:new'), button('⚪️ Закрыта', f'admin:status:{token}:lost')],
+        [button('← К заявкам', 'admin:leads')])
+
+
+async def load_leads_view():
+    try:
+        return leads_view(await asyncio.to_thread(gsheets.recent_sheet_leads))
+    except Exception:
+        logging.exception('Cannot read leads sheet')
+        return ('⚠️ Не удалось загрузить заявки из Google Sheets. Проверьте доступ, заголовки и LEADS_SHEET_NAME.',
+                markup([button('↻ Повторить', 'admin:leads'), button('← Назад', 'admin:home')]))
 
 
 def dialog_view(tg_id, status=''):
@@ -129,6 +166,8 @@ async def show_panel(message, bot, view):
 @router.message(CommandStart(), F.func(owner))
 @router.message(Command('panel'), F.func(owner))
 async def start(message: Message, bot: Bot):
+    selection_choices.clear()
+    lead_tokens.clear()
     sessions.pop(message.from_user.id, None)
     test_mode.discard(message.from_user.id)
     catalog_modes.pop(message.from_user.id, None)
@@ -145,6 +184,8 @@ def test_view():
 
 @router.message(Command('test'), F.func(owner))
 async def test_command(message: Message, bot: Bot):
+    selection_choices.clear()
+    lead_tokens.clear()
     sessions.pop(message.from_user.id, None)
     catalog_modes.pop(message.from_user.id, None)
     pending_changes.pop(message.from_user.id, None)
@@ -154,17 +195,19 @@ async def test_command(message: Message, bot: Bot):
 
 @router.message(Command('leads'), F.func(owner))
 async def leads(message: Message, bot: Bot):
+    selection_choices.clear()
     catalog_modes.pop(message.from_user.id, None)
     pending_changes.pop(message.from_user.id, None)
     sessions.pop(message.from_user.id, None)
     test_mode.discard(message.from_user.id)
-    await show_panel(message, bot, leads_view())
+    await show_panel(message, bot, await load_leads_view())
 
 
 def catalog_view(data, note=''):
-    lines = ['🗂 Услуги и новости', '', 'Данные из Google Sheets · только активные записи']
+    lines = ['🗂 Услуги, новости и контекст', '', 'Данные из Google Sheets · только активные записи']
     services = data['Services']
     news = data['News']
+    context = data.get('Context', [])
     lines.append('\nУслуги:')
     lines.extend(f"• {r['name'][:100]} — {r['price'][:80]}" for r in services[:8])
     if not services:
@@ -175,24 +218,69 @@ def catalog_view(data, note=''):
     lines.extend(f"• {r['title'][:120]}" for r in news[:5])
     if not news:
         lines.append('Пока нет записей')
+    lines.append('\nКонтекст:')
+    lines.extend(f"• {r['title'][:120]}" for r in context[:5])
+    if not context:
+        lines.append('Пока нет записей')
     if note:
         lines.extend(['', note])
     return '\n'.join(lines)[:4000], markup(
         [button('＋ Услуга', 'admin:add:Services', 'success'), button('＋ Новость', 'admin:add:News', 'success')],
         [button('✏️ Изменить цену', 'admin:add:Price', 'primary'), button('✏️ Изменить новость', 'admin:add:NewsEdit', 'primary')],
+        [button('👁 Услуги', 'admin:add:ServiceToggle'), button('👁 Новости', 'admin:add:NewsToggle')],
+        [button('＋ Контекст', 'admin:add:Context', 'success'), button('✏️ Изменить контекст', 'admin:add:ContextEdit', 'primary')],
+        [button('👁 Контекст', 'admin:add:ContextToggle')],
         [button('↻ Обновить', 'admin:catalog'), button('← Назад', 'admin:home')])
 
 
-def input_view(kind):
-    examples = {
-        'Services': 'название | цена | описание\nНапример: Диагностика | 500 ₽ | Бесплатно при ремонте',
-        'News': 'заголовок | текст\nНапример: График | 1 мая работаем до 16:00',
-        'Price': 'название услуги | новая цена\nНапример: Диагностика | 600 ₽',
-        'NewsEdit': 'заголовок новости | новый текст\nНапример: График | Работаем до 18:00',
-    }
-    return ('✍️ Отправьте одной строкой:\n\n' + examples[kind] +
-            '\n\nИзменение будет показано для подтверждения.',
-            markup([button('← Отмена', 'admin:catalog')]))
+FIELD_PROMPTS = {
+    'Services': ('название услуги', 'цену или диапазон', 'описание услуги'),
+    'News': ('заголовок новости', 'текст новости'),
+    'Price': ('название услуги', 'новую цену'),
+    'NewsEdit': ('заголовок новости', 'новый текст'),
+    'Context': ('тему', 'содержание для агента'),
+    'ContextEdit': ('тему', 'новое содержание'),
+}
+
+
+def input_view(state):
+    fields = state['fields']
+    prompts = FIELD_PROMPTS[state['kind']]
+    step = len(fields)
+    lines = [f'✍️ Шаг {step + 1} из {len(prompts)}', '', f'Отправьте {prompts[step]} одним сообщением.']
+    if fields:
+        lines.extend(['', 'Уже заполнено:'] + [f'• {value[:250]}' for value in fields])
+    buttons = []
+    if fields:
+        buttons.append(button('← Назад', 'admin:wback'))
+    buttons.append(button('✕ Отмена', 'admin:catalog'))
+    return '\n'.join(lines), markup(buttons)
+
+
+def selection_view(kind, data, page):
+    selection_choices.clear()
+    service = kind in ('Price', 'ServiceToggle')
+    source = 'Services' if service else ('Context' if kind in ('ContextEdit', 'ContextToggle') else 'News')
+    rows = data.get(source, [])
+    namekey = 'name' if service else 'title'
+    valuekey = 'price' if kind == 'Price' else ('text' if kind in ('NewsEdit', 'ContextEdit') else 'active')
+    page = min(max(0, page), max(0, (len(rows) - 1) // 8))
+    title = 'Выберите услугу' if service else ('Выберите тему' if source == 'Context' else 'Выберите новость')
+    buttons = []
+    for row in rows[page * 8:page * 8 + 8]:
+        token = secrets.token_urlsafe(6)
+        selection_choices[token] = (kind, row[namekey], row[valuekey])
+        prefix = ('🟢 ' if row.get('_active', True) else '⚪️ ') if kind in ('ServiceToggle', 'NewsToggle', 'ContextToggle') else ''
+        buttons.append([button((prefix + row[namekey])[:55], f'admin:select:{token}')])
+    navigation = []
+    if page:
+        navigation.append(button('‹ Назад', f'admin:choose:{kind}:{page - 1}'))
+    if (page + 1) * 8 < len(rows):
+        navigation.append(button('Далее ›', f'admin:choose:{kind}:{page + 1}'))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([button('✕ Отмена', 'admin:catalog')])
+    return f'🗂 {title}\n\nСтраница {page + 1} · Всего: {len(rows)}', markup(*buttons)
 
 
 @router.callback_query(F.data.startswith('admin:') | F.data.startswith('reply:') | F.data.startswith('end:'))
@@ -201,7 +289,9 @@ async def navigation(callback: CallbackQuery, bot: Bot):
         await callback.answer('Нет доступа', show_alert=True)
         return
     data = callback.data
-    if not (data.startswith('admin:add:') or data.startswith('admin:confirm:')):
+    if not data.startswith(('admin:add:', 'admin:choose:', 'admin:select:')) and data != 'admin:wback':
+        selection_choices.clear()
+    if not (data.startswith(('admin:add:', 'admin:confirm:', 'admin:choose:', 'admin:select:')) or data == 'admin:wback'):
         catalog_modes.pop(callback.from_user.id, None)
         pending_changes.pop(callback.from_user.id, None)
     try:
@@ -217,16 +307,62 @@ async def navigation(callback: CallbackQuery, bot: Bot):
                 logging.exception('Catalog read failed')
                 view = ('Не удалось загрузить таблицу. Проверьте доступ и заголовки листов.',
                         markup([button('↻ Повторить', 'admin:catalog'), button('← Назад', 'admin:home')]))
-        elif data.startswith('admin:add:'):
-            kind = data.rsplit(':', 1)[-1]
-            if kind not in ('Services', 'News', 'Price', 'NewsEdit'):
+        elif data.startswith(('admin:add:', 'admin:choose:')):
+            parts = data.split(':')
+            kind = parts[2] if len(parts) > 2 else ''
+            if kind not in ('Services', 'News', 'Context', 'Price', 'NewsEdit', 'ContextEdit', 'ServiceToggle', 'NewsToggle', 'ContextToggle'):
                 await callback.answer('Неизвестный раздел')
                 return
             test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             pending_changes.pop(callback.from_user.id, None)
-            catalog_modes[callback.from_user.id] = (kind, callback.message.chat.id, callback.message.message_id)
-            view = input_view(kind)
+            catalog_modes.pop(callback.from_user.id, None)
+            if kind in ('Price', 'NewsEdit', 'ContextEdit', 'ServiceToggle', 'NewsToggle', 'ContextToggle'):
+                page = int(parts[3]) if len(parts) > 3 else 0
+                try:
+                    view = selection_view(kind, await asyncio.to_thread(gsheets.catalog, kind in ('ServiceToggle', 'NewsToggle', 'ContextToggle')), page)
+                except Exception:
+                    logging.exception('Catalog selection failed')
+                    view = ('⚠️ Не удалось прочитать таблицу.', markup([button('← К каталогу', 'admin:catalog')]))
+            else:
+                state = {'kind': kind, 'chat': callback.message.chat.id, 'panel': callback.message.message_id, 'fields': [], 'expected': None}
+                catalog_modes[callback.from_user.id] = state
+                view = input_view(state)
+        elif data.startswith('admin:select:'):
+            token = data.rsplit(':', 1)[-1]
+            selected = selection_choices.pop(token, None)
+            if not selected:
+                await callback.answer('Список устарел. Откройте каталог заново.', show_alert=True)
+                return
+            kind, name, expected = selected
+            selection_choices.clear()
+            if kind in ('ServiceToggle', 'NewsToggle', 'ContextToggle'):
+                is_active = expected.strip().lower() not in ('0', 'false', 'нет', 'no', 'off')
+                target = 'false' if is_active else 'true'
+                nonce = secrets.token_urlsafe(8)
+                pending_changes[callback.from_user.id] = (nonce, kind, [name, target], expected)
+                action = 'Скрыть' if is_active else 'Опубликовать'
+                view = (f'{action} запись «{name[:200]}»?\n\nПосле подтверждения запись изменится в Google Sheets.',
+                        markup([button('✅ Подтвердить', f'admin:confirm:{nonce}', 'success'), button('Отмена', 'admin:catalog')]))
+                await edit(callback, view)
+                await adopt_panel(bot, callback.from_user.id, callback.message.chat.id, callback.message.message_id)
+                await callback.answer()
+                return
+            state = {'kind': kind, 'chat': callback.message.chat.id, 'panel': callback.message.message_id, 'fields': [name], 'expected': expected}
+            catalog_modes[callback.from_user.id] = state
+            view = input_view(state)
+        elif data == 'admin:wback':
+            state = catalog_modes.get(callback.from_user.id)
+            if not state or not state['fields']:
+                await callback.answer('Откройте раздел заново', show_alert=True)
+                return
+            if state['kind'] in ('Price', 'NewsEdit', 'ContextEdit') and len(state['fields']) == 1:
+                kind = state['kind']
+                catalog_modes.pop(callback.from_user.id, None)
+                view = selection_view(kind, await asyncio.to_thread(gsheets.catalog), 0)
+            else:
+                state['fields'].pop()
+                view = input_view(state)
         elif data.startswith('admin:confirm:'):
             pending = pending_changes.get(callback.from_user.id)
             token = data.rsplit(':', 1)[-1]
@@ -241,6 +377,11 @@ async def navigation(callback: CallbackQuery, bot: Bot):
                     await asyncio.to_thread(gsheets.update_price, fields[0], fields[1], expected)
                 elif kind == 'NewsEdit':
                     await asyncio.to_thread(gsheets.update_news, fields[0], fields[1], expected)
+                elif kind == 'ContextEdit':
+                    await asyncio.to_thread(gsheets.update_context, fields[0], fields[1], expected)
+                elif kind in ('ServiceToggle', 'NewsToggle', 'ContextToggle'):
+                    sheet = {'ServiceToggle': 'Services', 'NewsToggle': 'News', 'ContextToggle': 'Context'}[kind]
+                    await asyncio.to_thread(gsheets.set_active, sheet, fields[0], fields[1], expected)
                 else:
                     await asyncio.to_thread(gsheets.add_entry, kind, fields)
                 note = '✅ Изменение сохранено в таблице.'
@@ -270,10 +411,48 @@ async def navigation(callback: CallbackQuery, bot: Bot):
             test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
             view = home_view()
+        elif data == 'admin:report':
+            test_mode.discard(callback.from_user.id)
+            sessions.pop(callback.from_user.id, None)
+            try:
+                report = await asyncio.to_thread(gsheets.lead_report)
+                text = (f"📊 Заявки · отчёт\n\nВсего: {report['total']}\n"
+                        f"🆕 Новые: {report['new']}\n🟡 В работе: {report['in_progress']}\n"
+                        f"✅ Завершены: {report['done']}\n⚪️ Закрыты: {report['lost']}\n"
+                        f"Другие статусы: {report['other']}\n\nИсточник: Google Sheets.")
+                view = (text, markup([button('↻ Обновить', 'admin:report'), button('← Назад', 'admin:home')]))
+            except Exception:
+                logging.exception('Cannot read lead report')
+                view = ('⚠️ Не удалось загрузить отчёт из таблицы.', markup([button('↻ Повторить', 'admin:report'), button('← Назад', 'admin:home')]))
         elif data == 'admin:leads':
             test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
-            view = leads_view()
+            view = await load_leads_view()
+        elif data.startswith('admin:lead:'):
+            token = data.rsplit(':', 1)[-1]
+            snapshot = lead_tokens.get(token)
+            if not snapshot:
+                await callback.answer('Список устарел. Обновите заявки.', show_alert=True)
+                return
+            view = lead_view(token, snapshot)
+        elif data.startswith('admin:status:'):
+            parts = data.split(':')
+            if len(parts) != 4 or parts[3] not in gsheets.LEAD_STATUSES:
+                await callback.answer('Некорректный статус')
+                return
+            token, status = parts[2], parts[3]
+            snapshot = lead_tokens.pop(token, None)
+            if not snapshot:
+                await callback.answer('Заявка устарела. Обновите список.', show_alert=True)
+                return
+            try:
+                await asyncio.to_thread(gsheets.update_lead_status, snapshot, status)
+                rows = await asyncio.to_thread(gsheets.recent_sheet_leads)
+                view = leads_view(rows)
+            except Exception:
+                logging.exception('Failed to update lead status')
+                view = ('⚠️ Не удалось подтвердить изменение статуса. Обновите список и проверьте таблицу: при сбое сети запись могла сохраниться.',
+                        markup([button('↻ Обновить заявки', 'admin:leads')]))
         elif data.startswith('admin:queue:'):
             test_mode.discard(callback.from_user.id)
             sessions.pop(callback.from_user.id, None)
@@ -320,40 +499,32 @@ async def navigation(callback: CallbackQuery, bot: Bot):
 @router.message(F.func(owner), F.text)
 async def owner_message(message: Message, bot: Bot):
     if message.from_user.id in catalog_modes:
-        kind, chat_id, panel_id = catalog_modes[message.from_user.id]
-        fields = [field.strip() for field in message.text.split('|')]
-        count = {'Services': 3, 'News': 2, 'Price': 2, 'NewsEdit': 2}[kind]
-        if len(fields) != count or not all(fields) or any(len(field) > 1000 for field in fields):
-            await message.answer('Проверьте поля: разделите их символом |, заполните все поля (до 1000 символов).')
+        state = catalog_modes[message.from_user.id]
+        value = message.text.strip()
+        if not value or len(value) > 1000:
+            await message.answer('Пожалуйста, отправьте непустое значение до 1000 символов.')
             return
-        expected = None
-        if kind in ('Price', 'NewsEdit'):
-            try:
-                data = await asyncio.to_thread(gsheets.catalog)
-                rows = data['Services' if kind == 'Price' else 'News']
-                key = 'name' if kind == 'Price' else 'title'
-                found = [r for r in rows if r[key].strip().casefold() == fields[0].casefold()]
-                if len(found) != 1:
-                    await message.answer('Активная запись не найдена или название неоднозначно. Укажите точное название.')
-                    return
-                expected = found[0]['price' if kind == 'Price' else 'text']
-            except Exception:
-                logging.exception('Could not check price')
-                await message.answer('Не удалось проверить таблицу. Попробуйте позже.')
-                return
-        token = secrets.token_urlsafe(8)
-        pending_changes[message.from_user.id] = (token, kind, fields, expected)
-        catalog_modes.pop(message.from_user.id, None)
-        text = 'Проверьте перед сохранением:\n\n' + '\n'.join(fields)
-        if expected is not None:
-            text += f'\nТекущее значение: {expected}'
-        keyboard = markup([button('✅ Сохранить', f'admin:confirm:{token}', 'success'), button('Отмена', 'admin:catalog')])
+        state['fields'].append(value)
+        kind = state['kind']
+        if len(state['fields']) < len(FIELD_PROMPTS[kind]):
+            text, keyboard = input_view(state)
+        else:
+            fields = list(state['fields'])
+            expected = state['expected']
+            token = secrets.token_urlsafe(8)
+            pending_changes[message.from_user.id] = (token, kind, fields, expected)
+            catalog_modes.pop(message.from_user.id, None)
+            text = '🔎 Проверьте перед сохранением:\n\n' + '\n'.join(f'{label.capitalize()}: {field}' for label, field in zip(FIELD_PROMPTS[kind], fields))
+            if expected is not None:
+                text += f'\n\nТекущее значение: {expected}'
+            keyboard = markup([button('✅ Сохранить', f'admin:confirm:{token}', 'success'), button('✕ Отмена', 'admin:catalog')])
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=panel_id, text=text[:4000], reply_markup=keyboard)
+            await bot.edit_message_text(chat_id=state['chat'], message_id=state['panel'], text=text[:4000], reply_markup=keyboard)
         except Exception:
-            logging.exception('Could not show confirmation')
+            logging.exception('Could not update catalog wizard')
+            catalog_modes.pop(message.from_user.id, None)
             pending_changes.pop(message.from_user.id, None)
-            await message.answer('Не удалось показать подтверждение. Откройте /panel и повторите.')
+            await message.answer('Не удалось обновить панель. Откройте /panel и повторите.')
         return
     if message.from_user.id in test_mode:
         from bot.handlers.client import process_client

@@ -63,3 +63,17 @@ class AgentContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('save_lead', [fn.name for fn in payload.functions])
         self.assertIn('У меня смартфон', [message.content for message in payload.messages])
         self.assertIn('уже сохранён', payload.messages[0].content)
+
+
+class ContactSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_rejects_invented_contact(self):
+        with patch.object(tools.repos, 'history', return_value=[('user', 'Хочу купить')]), patch.object(tools, 'save_lead', new=AsyncMock()) as save:
+            result = json.loads(await tools.execute_tool('save_lead', {'contact': '+7 999 123-45-67', 'question': 'покупка'}, None, 12, 'test'))
+        self.assertEqual(result['status'], 'error')
+        save.assert_not_awaited()
+
+    async def test_tool_accepts_explicitly_shared_phone(self):
+        with patch.object(tools.repos, 'history', return_value=[('user', 'Номер +7 (999) 123-45-67')]), patch.object(tools, 'save_lead', new=AsyncMock()) as save:
+            result = json.loads(await tools.execute_tool('save_lead', {'contact': '+79991234567', 'question': 'покупка'}, None, 12, 'test'))
+        self.assertEqual(result['status'], 'success')
+        save.assert_awaited_once()
